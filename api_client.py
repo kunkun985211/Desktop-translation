@@ -1,24 +1,68 @@
-"""DeepSeek 流式客户端；只在一次完整请求成功后返回可用于对话历史的回答。"""
+"""Chat Completions 流式客户端；仅完整成功的回答可加入对话历史。"""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping, Sequence
 from threading import Event
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import requests
 
 
-API_URL = "https://api.deepseek.com/chat/completions"
+DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-flash"
 
 
-class DeepSeekError(Exception):
+class APIError(Exception):
     """可以直接向用户展示、且不包含密钥或远端响应正文的错误。"""
 
 
 class ChatCancelled(Exception):
     """用户关闭窗口或启动另一请求；调用方应静默丢弃本次回答。"""
+
+
+def _contains_control(value: str) -> bool:
+    return any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value)
+
+
+def normalize_base_url(value: str) -> str:
+    """返回无尾斜杠、无 /chat/completions 后缀的基础地址。
+
+    缺省协议使用 HTTPS。HTTP 只允许明确的本机地址，异常不回显输入。
+    """
+    invalid = 'API 地址无效：请填写 HTTPS 地址；HTTP 仅允许 localhost、127.0.0.1 或 [::1]。'
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(invalid)
+    if _contains_control(value):
+        raise ValueError(invalid)
+    value = value.strip()
+    decoded = unquote(value)
+    if (_contains_control(decoded) or any(char.isspace() for char in decoded)
+            or any(char in value for char in ('?', '#', '\\'))):
+        raise ValueError(invalid)
+    if '://' not in value:
+        value = 'https://' + value
+    try:
+        parts = urlsplit(value)
+        host = parts.hostname
+        port = parts.port
+        if (parts.scheme not in ('https', 'http') or not host
+                or parts.username is not None or parts.password is not None
+                or '%' in host or '@' in parts.netloc
+                or (port is not None and not 1 <= port <= 65535)):
+            raise ValueError()
+        if parts.scheme == 'http' and host not in ('localhost', '127.0.0.1', '::1'):
+            raise ValueError()
+        authority = '[' + host + ']' if ':' in host else host
+        if port is not None:
+            authority += ':' + str(port)
+        path = parts.path.rstrip('/')
+        if path.endswith('/chat/completions'):
+            path = path[:-len('/chat/completions')].rstrip('/')
+        return urlunsplit((parts.scheme, authority, path, '', ''))
+    except ValueError:
+        raise ValueError(invalid) from None
 
 
 def build_messages(
@@ -78,7 +122,7 @@ def _events(response: requests.Response, cancel: Event):
         try:
             line = raw_line.decode("utf-8")
         except UnicodeDecodeError:
-            raise DeepSeekError("服务返回了无法读取的数据，请重试。") from None
+            raise APIError("服务返回了无法读取的数据，请重试。") from None
         if not line:
             if data:
                 yield "\n".join(data)
@@ -97,6 +141,9 @@ def stream_chat(
     cancel: Event,
     on_delta: Callable[[str], None],
     model: str = DEFAULT_MODEL,
+    *,
+    provider: str = 'deepseek',
+    base_url: str = DEFAULT_BASE_URL,
 ) -> str:
     """在后台线程调用；on_delta 同线程执行，GUI 更新须由调用方调度。
 
@@ -104,24 +151,43 @@ def stream_chat(
     窗口可以立即关闭，无须等待网络线程。异常情况下已显示的片段不可加入历史。
     """
     _check_cancelled(cancel)
+    if provider not in ('deepseek', 'openai_compatible'):
+        raise APIError('API 服务类型不受支持，请重新选择。')
+    try:
+        endpoint = normalize_base_url(base_url) + '/chat/completions'
+    except ValueError as error:
+        raise APIError(str(error)) from None
     if not isinstance(api_key, str) or not api_key.strip():
-        raise DeepSeekError("尚未设置 DeepSeek API 密钥，请在设置中填写。")
-    if not api_key.isascii() or "\n" in api_key or "\r" in api_key:
-        raise DeepSeekError("API 密钥格式不正确，请重新填写。")
+        raise APIError("尚未设置 API 密钥，请在设置中填写。")
+    if (not api_key.isascii()
+            or _contains_control(api_key)
+            or any(char.isspace() for char in api_key.strip())):
+        raise APIError("API 密钥格式不正确，请重新填写。")
+    if (not isinstance(model, str) or not model.strip()
+            or _contains_control(model)):
+        raise APIError('模型名称无效，请在设置中填写。')
+    if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)) or not messages:
+        raise APIError('请求中没有有效的对话内容。')
+    conversation = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            raise APIError('对话内容格式无效，请重新开始。')
+        role, content = message.get('role'), message.get('content')
+        if role not in ('system', 'user', 'assistant') or not isinstance(content, str) or not content.strip():
+            raise APIError('对话内容格式无效，请重新开始。')
+        conversation.append({'role': role, 'content': content})
+    if not callable(on_delta):
+        raise APIError('回答显示处理器无效。')
+    body = {'model': model.strip(), 'messages': conversation, 'stream': True}
+    if provider == 'deepseek':
+        body.update(thinking={'type': 'disabled'}, temperature=0.2, max_tokens=4096)
     parts: list[str] = []
     finished = False
     try:
         with requests.post(
-            API_URL,
+            endpoint,
             headers={"Authorization": "Bearer " + api_key.strip()},
-            json={
-                "model": model,
-                "messages": [dict(message) for message in messages],
-                "thinking": {"type": "disabled"},
-                "stream": True,
-                "temperature": 0.2,
-                "max_tokens": 4096,
-            },
+            json=body,
             stream=True,
             timeout=(8, 30),
             allow_redirects=False,
@@ -130,21 +196,22 @@ def stream_chat(
             status = response.status_code
             if status != 200:
                 errors = {
-                    400: "请求未被接受，请缩短选文或对话后重试。",
-                    401: "DeepSeek API 密钥无效，请在设置中检查密钥。",
-                    402: "DeepSeek 账户余额不足，请充值后重试。",
-                    403: "此 DeepSeek 密钥没有访问权限，请检查账户设置。",
+                    400: "请求未被接受，请检查模型名称或缩短对话后重试。",
+                    401: "API 密钥无效，请在设置中检查当前服务的密钥。",
+                    402: "API 账户余额不足，请充值后重试。",
+                    403: "此 API 密钥没有访问权限，请检查账户设置。",
+                    404: "API 地址或模型不存在，请检查设置。",
                     429: "请求过于频繁或服务繁忙，请稍后重试。",
                 }
                 if status >= 500:
-                    raise DeepSeekError("DeepSeek 服务暂时不可用，请稍后重试。")
-                raise DeepSeekError(errors.get(status, f"DeepSeek 请求失败（HTTP {status}），请稍后重试。"))
+                    raise APIError("API 服务暂时不可用，请稍后重试。")
+                raise APIError(errors.get(status, f"API 请求失败（HTTP {status}），请稍后重试。"))
 
             for event in _events(response, cancel):
                 _check_cancelled(cancel)
                 if event == "[DONE]":
                     if not finished or not "".join(parts).strip():
-                        raise DeepSeekError("服务没有返回完整回答，请重试。")
+                        raise APIError("服务没有返回完整回答，请重试。")
                     return "".join(parts)
                 try:
                     payload = json.loads(event)
@@ -163,24 +230,24 @@ def stream_chat(
                     if content is not None and not isinstance(content, str):
                         raise ValueError()
                     finish_reason = choice.get("finish_reason")
-                    if finish_reason == "length":
-                        raise DeepSeekError("回答达到长度上限，请缩短选文或问题后重试。")
-                    if finish_reason not in {None, "stop"}:
-                        raise DeepSeekError("回答未正常完成，请调整问题后重试。")
-                    if content:
-                        if finished:
-                            raise ValueError()
-                        parts.append(content)
-                        _check_cancelled(cancel)
-                        on_delta(content)
-                    if finish_reason == "stop":
-                        finished = True
                 except (KeyError, IndexError, TypeError, ValueError):
-                    raise DeepSeekError("服务返回的数据不完整或格式异常，请重试。") from None
-            raise DeepSeekError("连接中断，回答未完整接收，请重试。")
+                    raise APIError("服务返回的数据不完整或格式异常，请重试。") from None
+                if finish_reason == "length":
+                    raise APIError("回答达到长度上限，请缩短选文或问题后重试。")
+                if finish_reason not in (None, "stop"):
+                    raise APIError("回答未正常完成，请调整问题后重试。")
+                if content:
+                    if finished:
+                        raise APIError("服务返回的数据不完整或格式异常，请重试。")
+                    parts.append(content)
+                    _check_cancelled(cancel)
+                    on_delta(content)
+                if finish_reason == "stop":
+                    finished = True
+            raise APIError("连接中断，回答未完整接收，请重试。")
     except requests.exceptions.Timeout:
         _check_cancelled(cancel)
-        raise DeepSeekError("请求超时，请检查网络后重试。") from None
+        raise APIError("请求超时，请检查网络后重试。") from None
     except requests.exceptions.RequestException:
         _check_cancelled(cancel)
-        raise DeepSeekError("网络连接失败或中断，请检查网络后重试。") from None
+        raise APIError("网络连接失败或中断，请检查网络后重试。") from None

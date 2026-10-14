@@ -11,9 +11,10 @@ gi.require_version('AyatanaAppIndicator3', '0.1')
 from gi.repository import Gtk, Gdk, Gio, GLib, AyatanaAppIndicator3
 
 import config
-from deepseek_client import build_messages, stream_chat, DeepSeekError, ChatCancelled
+from api_client import build_messages, stream_chat, APIError, ChatCancelled
+from settings_ui import SettingsWindow
 from selection import SelectionMonitor
-from ui import SelectionBar, ResultWindow, apply_style, contains, label, style
+from ui import SelectionBar, ResultWindow, apply_style, contains
 
 MAX_SELECTION = 20000
 MAX_CONVERSATION = 80000
@@ -60,7 +61,7 @@ class Assistant(Gtk.Application):
         self.add_window(self.panel)
         self._setup_tray()
         try:
-            self.api_key = config.load_key()
+            self.api_key = config.load_key(self.settings)
         except GLib.Error:
             self._notify('系统密钥环暂时不可用，请打开设置重新配置。')
         try:
@@ -207,7 +208,7 @@ class Assistant(Gtk.Application):
             self.panel.set_status(f'选文超过 {MAX_SELECTION} 字符，请分段选取。', True)
             return False
         if not self.api_key:
-            self.panel.set_status('请在设置中保存 DeepSeek API Key，然后重试。', True)
+            self.panel.set_status('请在设置中保存当前服务的 API Key，然后重试。', True)
             self.panel.retry.show()
             return False
         if sum(len(item['content']) for item in self.history) + len(self.text) + len(question or '') > MAX_CONVERSATION:
@@ -231,23 +232,26 @@ class Assistant(Gtk.Application):
         self.answer_question = question
         self.answer_incomplete = True
         self.partial = ''
-        key, model = self.api_key, self.settings['model']
+        key, connection = self.api_key, dict(self.settings)
+        self.panel.set_status('正在请求 ' + config.provider_label(connection['provider']) + '…')
 
         def run():
             try:
                 answer = stream_chat(key, messages, cancel,
-                    lambda part: GLib.idle_add(self.delta, request_id, part), model=model)
+                    lambda part: GLib.idle_add(self.delta, request_id, part),
+                    model=connection['model'], provider=connection['provider'],
+                    base_url=connection['base_url'])
                 GLib.idle_add(self.completed, request_id, answer, history)
             except ChatCancelled:
                 pass
-            except DeepSeekError as error:
+            except APIError as error:
                 GLib.idle_add(self.failed, request_id, str(error))
             except Exception:
                 GLib.idle_add(self.failed, request_id, '请求处理发生异常，请重试。')
             finally:
                 self.slots.release()
 
-        threading.Thread(target=run, name='deepseek-request', daemon=True).start()
+        threading.Thread(target=run, name='api-request', daemon=True).start()
         return True
 
     def delta(self, request_id, part):
@@ -277,7 +281,7 @@ class Assistant(Gtk.Application):
         self.answer_incomplete = False
         self.cancel_event = None
         self.panel.set_busy(False)
-        self.panel.set_status('DeepSeek · 点击窗口外部隐藏 · Esc 关闭')
+        self.panel.set_status(config.provider_label(self.settings['provider']) + ' · 点击窗口外部隐藏 · Esc 关闭')
         if self.mode == 'explain':
             self.panel.input.grab_focus()
         return False
@@ -310,73 +314,36 @@ class Assistant(Gtk.Application):
         if self.settings_window:
             self.settings_window.present()
             return
-        window = Gtk.Window(title='划词助手 · 设置')
+        window = SettingsWindow(self.settings, bool(self.api_key), self.save_connection)
         self.settings_window = window
         self.add_window(window)
-        style(window, 'assistant')
-        window.set_default_size(520, 430)
-        window.set_border_width(24)
-        window.set_position(Gtk.WindowPosition.CENTER)
         window.connect('destroy', lambda *_: setattr(self, 'settings_window', None))
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
-        window.add(box)
-        box.pack_start(label('阅读不停步', 'heading'), False, False, 0)
-        intro = label('选中文字 → 翻译 / 解释 → 在原处继续追问', 'muted')
-        box.pack_start(intro, False, False, 0)
-        key_label = label('DeepSeek API Key · 已保存在系统密钥环' if self.api_key else 'DeepSeek API Key')
-        box.pack_start(key_label, False, False, 0)
-        entry = Gtk.Entry()
-        entry.set_visibility(False)
-        entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
-        entry.set_placeholder_text('留空保留已有密钥' if self.api_key else 'sk-…')
-        box.pack_start(entry, False, False, 0)
-        model_row = Gtk.Box(spacing=10)
-        model_row.pack_start(label('模型'), True, True, 0)
-        model_row.pack_start(label('DeepSeek Flash · 经济模式'), False, False, 0)
-        box.pack_start(model_row, False, False, 0)
-        automatic = Gtk.CheckButton(label='登录桌面后自动启动')
-        automatic.set_active(config.AUTOSTART_FILE.exists())
-        box.pack_start(automatic, False, False, 0)
-        note = label('仅在点击功能时发送选文和本次对话。\n支持可选中的文字；图片及扫描 PDF 需要 OCR。', 'muted')
-        note.set_line_wrap(True)
-        box.pack_start(note, False, False, 0)
-        feedback = label('', 'muted')
-        feedback.set_line_wrap(True)
-        feedback.set_max_width_chars(55)
-        box.pack_start(feedback, True, True, 0)
-        save = style(Gtk.Button(label='保存并开始划词'), 'primary')
-        box.pack_start(save, False, False, 0)
-
-        def save_clicked(*_):
-            try:
-                value = entry.get_text().strip()
-                if value:
-                    config.store_key(value)
-                    self.api_key = value
-                    entry.set_text('')
-                if not self.api_key:
-                    feedback.set_text('请先填写 DeepSeek API Key。')
-                    return
-                self.settings['model'] = config.MODELS[0]
-                config.save_settings(self.settings)
-                config.set_autostart(automatic.get_active())
-            except (ValueError, RuntimeError) as error:
-                feedback.set_text(str(error))
-                return
-            except (OSError, GLib.Error):
-                feedback.set_text('保存失败，请检查系统密钥环与配置目录权限。')
-                return
-            window.destroy()
-            self._notify('已就绪：选中文字，点击“翻译”或“解释”。')
-
-        save.connect('clicked', save_clicked)
         window.show_all()
         window.present()
+
+    def save_connection(self, settings, new_key, autostart):
+        # 暂停由托盘控制，设置窗口打开时的副本不能覆盖此后的切换。
+        settings = config.normalize_settings(dict(settings, paused=self.settings['paused']))
+        key = config.save_connection(settings, new_key, autostart)
+        changed = (settings != self.settings or key != self.api_key)
+        self.settings, self.api_key = settings, key
+        if changed:
+            # 连接配置变化后关闭旧会话，避免把已有对话发给另一服务。
+            self.hide()
+            self.history = []
+            self.text = ''
+            self.pending = None
+            self.failed_question = None
+            self.failed_question_displayed = False
+            self.answer_question = None
+            self.answer_incomplete = False
+        self._notify('设置已保存；划词当前暂停，可从托盘启用。' if settings['paused']
+                     else '已就绪：选中文字，点击“翻译”或“解释”。')
 
 
 def main():
     if '--set-key' in sys.argv:
-        value = getpass.getpass('输入 DeepSeek API Key（不回显）：')
+        value = getpass.getpass('输入当前服务的 API Key（不回显）：')
         try:
             config.store_key(value)
         except (ValueError, RuntimeError, GLib.Error):

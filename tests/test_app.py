@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app
-from deepseek_client import build_messages
+from api_client import build_messages
 
 
 def make_assistant():
@@ -20,11 +20,11 @@ def make_assistant():
     panel.begin_answer.side_effect = lambda **kwargs: setattr(panel, "busy", True)
     state = SimpleNamespace(
         text="VLA", history=[{"role": "assistant", "content": "首次完整解释"}],
-        api_key="fake-test-key", settings={"model": "deepseek-flash"},
+        api_key="fake-test-key", settings=app.config.normalize_settings({}),
         slots=threading.BoundedSemaphore(4), request_id=1, cancel_event=None,
         render_id=0, failed_question=None, failed_question_displayed=False,
         answer_question=None, answer_incomplete=False, mode="explain",
-        panel=panel, bar=MagicMock(), partial="", pending=None,
+        panel=panel, bar=MagicMock(), partial="", pending=None, _notify=MagicMock(),
     )
     for name in ("request", "stop_request", "retry", "completed", "failed", "delta", "hide"):
         setattr(state, name, getattr(app.Assistant, name).__get__(state))
@@ -156,6 +156,69 @@ class AppStateTests(unittest.TestCase):
         state.completed(state.request_id, "完整回答", state.history + [{"role": "user", "content": "前一个问题"}])
         state.request("再举例")
         state.panel.begin_answer.assert_called_with(replace=False)
+
+
+class ConnectionSettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.state = make_assistant()
+        self.state.hide = MagicMock()
+        self.connection = app.config.normalize_settings({
+            'provider': 'openai_compatible', 'base_url': 'https://example.com/v1',
+            'model': 'example-model', 'tracking_id': 'account-id'})
+        self.persist = patch('app.config.save_connection', return_value=self.state.api_key).start()
+        self.addCleanup(patch.stopall)
+
+    def test_different_service_never_reuses_in_memory_key(self):
+        original = dict(self.state.settings)
+        self.persist.side_effect = ValueError('请填写当前服务的 API Key')
+        with self.assertRaises(ValueError):
+            app.Assistant.save_connection(self.state, self.connection, '', False)
+        self.persist.assert_called_once_with(self.connection, '', False)
+        self.assertEqual(self.state.settings, original)
+
+    def test_changed_connection_closes_and_clears_old_conversation(self):
+        self.persist.return_value = 'new-token'
+        app.Assistant.save_connection(self.state, self.connection, 'new-token', False)
+        self.persist.assert_called_once_with(self.connection, 'new-token', False)
+        self.assertEqual(self.state.settings, self.connection)
+        self.assertEqual(self.state.api_key, 'new-token')
+        self.state.hide.assert_called_once()
+        self.assertEqual(self.state.history, [])
+        self.assertEqual(self.state.text, '')
+        self.assertIsNone(self.state.pending)
+
+    def test_same_identity_keeps_saved_key_when_field_is_blank(self):
+        app.Assistant.save_connection(self.state, self.state.settings, '', False)
+        self.persist.assert_called_once_with(self.state.settings, '', False)
+        self.state.hide.assert_not_called()
+
+    def test_save_preserves_pause_changed_from_tray_after_window_opened(self):
+        opened_settings = dict(self.state.settings)
+        self.state.settings['paused'] = True
+        app.Assistant.save_connection(self.state, opened_settings, '', False)
+        self.assertTrue(self.state.settings['paused'])
+        self.assertTrue(self.persist.call_args.args[0]['paused'])
+
+    def test_keyring_failure_leaves_active_configuration_unchanged(self):
+        original = dict(self.state.settings)
+        self.persist.side_effect = RuntimeError('密钥环不可用')
+        with self.assertRaises(RuntimeError):
+            app.Assistant.save_connection(self.state, self.connection, 'new-token', False)
+        self.assertEqual(self.state.settings, original)
+        self.state.hide.assert_not_called()
+
+    def test_worker_uses_connection_snapshot_from_request_start(self):
+        state = self.state
+        with patch('app.threading.Thread') as thread, patch('app.GLib'), \
+             patch('app.stream_chat', return_value='回答') as stream:
+            state.request()
+            worker = thread.call_args.kwargs['target']
+            state.settings = self.connection
+            state.api_key = 'another-token'
+            worker()
+        self.assertEqual(stream.call_args.args[0], 'fake-test-key')
+        self.assertEqual(stream.call_args.kwargs['provider'], 'deepseek')
+        self.assertEqual(stream.call_args.kwargs['base_url'], 'https://api.deepseek.com')
 
 
 if __name__ == "__main__":

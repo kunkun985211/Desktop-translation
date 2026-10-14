@@ -386,7 +386,7 @@ class ResultWindow(Gtk.Window):
         self.answer_box.show_all()
         self.answer_notice.hide()
         self.set_busy(True)
-        self.set_status('正在请求 DeepSeek…')
+        self.set_status('正在请求 API…')
 
     def mark_answer_incomplete(self, message):
         if self.answer_notice is not None:
